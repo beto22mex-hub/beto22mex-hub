@@ -1,0 +1,23 @@
+
+# MES Lion System - System Requirements
+# -----------------------------------
+
+# Runtime Environment
+Node.js >= 18.0.0
+npm >= 9.0.0
+
+# Database
+Microsoft SQL Server (Azure SQL Database)
+Server: mx31testdbs01.database.windows.net
+Database Name: Liondb
+
+# Node.js Key Dependencies
+express >= 4.18.2      # Web framework
+mssql >= 10.0.1        # SQL Server driver
+cors >= 2.8.5          # Cross-Origin support
+dotenv >= 16.3.1       # Environment variables
+
+# Frontend
+React >= 18.2.0
+TailwindCSS >= 3.0.0
+Lucide React (Icons)

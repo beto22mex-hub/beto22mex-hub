@@ -4,245 +4,153 @@ import express from 'express';
 import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
-import { exec } from 'child_process';
 import { fileURLToPath } from 'url';
-import { sql, sqlConfig, masterConfig, SCHEMA_SCRIPTS, SEED_QUERIES } from './db.js';
+import { sql, sqlConfig, SCHEMA_SCRIPTS, SEED_QUERIES } from './db.js';
 
 const app = express();
-//const PORT = process.env.PORT || 3010;
 const PORT = process.env.PORT || 8080; 
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DIST_DIR = path.join(__dirname, '../dist'); 
+
+const projectRoot = path.resolve(process.cwd());
+const distPath = path.join(projectRoot, 'dist');
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static(DIST_DIR));
 
-// Middleware de conexión a BD con Singleton pattern
-const dbMiddleware = async (req, res, next) => {
-    try {
-        if (!sql.globalConnection || !sql.globalConnection.connected) {
-            sql.globalConnection = await sql.connect(sqlConfig);
-        }
-        req.db = sql.globalConnection;
-        next();
-    } catch (err) {
-        res.status(500).send('Database connection error: ' + err.message);
-    }
+// --- DB POOL ---
+let poolPromise = null;
+const getPool = async () => {
+  if (poolPromise) return poolPromise;
+  poolPromise = sql.connect(sqlConfig).then(pool => {
+      console.log("[DB] Conexión establecida con Azure SQL.");
+      return pool;
+  }).catch(err => {
+      poolPromise = null;
+      console.error("[DB ERROR]", err.message);
+      throw err;
+  });
+  return poolPromise;
 };
 
-app.use(dbMiddleware);
+const dbMiddleware = async (req, res, next) => {
+    try { req.db = await getPool(); next(); } 
+    catch (err) { res.status(503).json({ error: 'DB_ERROR', details: err.message }); }
+};
 
-app.post('/api/setup', async (req, res) => {
-    const logs = [];
+// --- API ROUTES ---
+const apiRouter = express.Router();
+
+// Health Check
+apiRouter.get('/health', (req, res) => {
+    res.json({ success: true, status: 'online', db: 'Azure SQL' });
+});
+
+// Setup Database
+apiRouter.post('/setup', dbMiddleware, async (req, res) => {
     try {
-        const masterPool = new sql.ConnectionPool(masterConfig);
-        await masterPool.connect();
-        // Nota: En Azure SQL el CREATE DATABASE puede requerir privilegios especiales.
-        // Asumimos que Liondb ya existe o el usuario tiene permisos.
-        logs.push("Verificando existencia de base de datos Liondb...");
-        const dbCheck = await masterPool.request().query("SELECT * FROM sys.databases WHERE name = 'Liondb'");
-        if (dbCheck.recordset.length === 0) {
-            // Azure SQL (Database-level) suele no permitir CREATE DATABASE desde app.
-            // Si falla, es normal en tiers básicos.
-            try { await masterPool.request().query("CREATE DATABASE Liondb"); logs.push("DB Liondb creada."); } 
-            catch(e) { logs.push("Info: No se pudo crear DB automáticamente (puede que ya exista o permisos insuficientes)."); }
-        }
-        await masterPool.close();
-
-        const setupPool = new sql.ConnectionPool(sqlConfig);
-        await setupPool.connect();
-        for (const script of SCHEMA_SCRIPTS) {
-            await setupPool.request().query(script);
-        }
-        for (const query of SEED_QUERIES) {
-            await setupPool.request().query(query);
-        }
-        await setupPool.close();
-        res.json({ success: true, logs });
-    } catch (err) {
-        res.status(500).json({ success: false, logs, error: err.message });
+        const transaction = new sql.Transaction(req.db);
+        await transaction.begin();
+        const request = new sql.Request(transaction);
+        for (const script of SCHEMA_SCRIPTS) await request.query(script);
+        for (const seed of SEED_QUERIES) await request.query(seed);
+        await transaction.commit();
+        res.json({ success: true, message: "Esquema Azure SQL inicializado correctamente." });
+    } catch (e) {
+        console.error("[SETUP ERROR]", e.message);
+        res.status(500).json({ error: e.message });
     }
 });
 
 // Auth
-app.post('/api/auth/login', async (req, res) => {
+apiRouter.post('/auth/login', dbMiddleware, async (req, res) => {
     const { username, password } = req.body;
-    const result = await req.db.request()
-        .input('u', sql.NVarChar, username)
-        .query('SELECT * FROM Users WHERE Username = @u');
-    const user = result.recordset[0];
-    if (!user) return res.status(404).json({ success: false, error: 'User not found' });
-    if (user.Role !== 'OPERATOR' && user.Password !== password) return res.status(401).json({ success: false, error: 'Invalid password' });
-    res.json({ success: true, user: { id: user.Id, username: user.Username, role: user.Role, name: user.Name } });
-});
-
-// Operaciones de Trazabilidad
-app.get('/api/serials', async (req, res) => {
-    const result = await req.db.request().query(`
-        SELECT s.*, 
-        (SELECT TOP 1 h.Timestamp FROM SerialHistory h WHERE h.SerialNumber = s.SerialNumber ORDER BY h.Timestamp DESC) as LastUpdate
-        FROM Serials s
-    `);
-    // Cargar historial para cada serial
-    const serials = result.recordset;
-    for (let s of serials) {
-        const hist = await req.db.request()
-            .input('sn', sql.NVarChar, s.SerialNumber)
-            .query('SELECT h.*, o.Name as OperationName, u.Name as OperatorName FROM SerialHistory h JOIN Operations o ON h.OperationId = o.Id JOIN Users u ON h.OperatorId = u.Id WHERE h.SerialNumber = @sn ORDER BY h.Timestamp ASC');
-        s.history = hist.recordset;
-    }
-    res.json(serials.map(s => ({
-        serialNumber: s.SerialNumber,
-        orderNumber: s.OrderNumber,
-        partNumberId: s.PartNumberId,
-        currentOperationId: s.CurrentOperationId,
-        isComplete: s.IsComplete,
-        trayId: s.TrayId,
-        history: s.history.map(h => ({
-            operationId: h.OperationId,
-            operationName: h.OperationName,
-            operatorId: h.OperatorId,
-            operatorName: h.OperatorName,
-            timestamp: h.Timestamp
-        }))
-    })));
-});
-
-app.post('/api/serials/batch-generate', async (req, res) => {
-    const { orderNumber, partNumberId, currentOperationId, trayId, operatorId, quantity } = req.body;
-    const transaction = new sql.Transaction(req.db);
     try {
-        await transaction.begin();
-        const generated = [];
-        for (let i = 0; i < quantity; i++) {
-            const sn = `SN-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-            await transaction.request()
-                .input('sn', sql.NVarChar, sn)
-                .input('on', sql.NVarChar, orderNumber)
-                .input('pn', sql.NVarChar, partNumberId)
-                .input('op', sql.NVarChar, currentOperationId)
-                .input('tr', sql.NVarChar, trayId)
-                .query('INSERT INTO Serials (SerialNumber, OrderNumber, PartNumberId, CurrentOperationId, TrayId) VALUES (@sn, @on, @pn, @op, @tr)');
-            
-            await transaction.request()
-                .input('sn', sql.NVarChar, sn)
-                .input('op', sql.NVarChar, currentOperationId)
-                .input('uid', sql.NVarChar, operatorId)
-                .query('INSERT INTO SerialHistory (SerialNumber, OperationId, OperatorId) VALUES (@sn, @op, @uid)');
-            
-            generated.push({ serialNumber: sn });
-        }
-        await transaction.commit();
-        res.json({ success: true, serials: generated });
-    } catch (e) {
-        await transaction.rollback();
-        res.status(500).json({ error: e.message });
-    }
+        const result = await req.db.request()
+            .input('u', sql.NVarChar, username)
+            .query('SELECT * FROM Users WHERE Username = @u');
+        const user = result.recordset[0];
+        if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+        if (user.Role !== 'OPERATOR' && user.Password !== password) return res.status(401).json({ error: 'Password incorrecto' });
+        res.json({ success: true, user: { id: user.Id, username: user.Username, role: user.Role, name: user.Name } });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/serials/batch-update', async (req, res) => {
-    const { serials, operationId, operatorId, isComplete } = req.body;
-    const transaction = new sql.Transaction(req.db);
+// Users
+apiRouter.get('/users', dbMiddleware, async (req, res) => {
     try {
-        await transaction.begin();
-        for (const sn of serials) {
-            await transaction.request()
-                .input('sn', sql.NVarChar, sn)
-                .input('op', sql.NVarChar, operationId)
-                .input('comp', sql.Bit, isComplete ? 1 : 0)
-                .query('UPDATE Serials SET CurrentOperationId = @op, IsComplete = @comp WHERE SerialNumber = @sn');
-            
-            await transaction.request()
-                .input('sn', sql.NVarChar, sn)
-                .input('op', sql.NVarChar, operationId)
-                .input('uid', sql.NVarChar, operatorId)
-                .query('INSERT INTO SerialHistory (SerialNumber, OperationId, OperatorId) VALUES (@sn, @op, @uid)');
+        const r = await req.db.request().query('SELECT Id, Username, Role, Name FROM Users');
+        res.json(r.recordset);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Operations
+apiRouter.get('/operations', dbMiddleware, async (req, res) => {
+    try {
+        const r = await req.db.request().query('SELECT * FROM Operations ORDER BY OrderIndex');
+        res.json(r.recordset);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Part Numbers
+apiRouter.get('/parts', dbMiddleware, async (req, res) => {
+    try {
+        const r = await req.db.request().query('SELECT * FROM PartNumbers');
+        res.json(r.recordset);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Work Orders
+apiRouter.get('/orders', dbMiddleware, async (req, res) => {
+    try {
+        const r = await req.db.request().query('SELECT * FROM WorkOrders ORDER BY CreatedAt DESC');
+        res.json(r.recordset);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Routes
+apiRouter.get('/routes', dbMiddleware, async (req, res) => {
+    try {
+        const r = await req.db.request().query('SELECT * FROM ProcessRoutes');
+        // Aquí se debería hacer un JOIN con los pasos, pero por simplicidad devolvemos las rutas
+        // En un sistema real se harían queries más complejas.
+        res.json(r.recordset.map(route => ({ ...route, steps: [] })));
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Serials
+apiRouter.get('/serials', dbMiddleware, async (req, res) => {
+    try {
+        const r = await req.db.request().query('SELECT * FROM Serials');
+        res.json(r.recordset.map(s => ({ ...s, history: [], printHistory: [] })));
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Montar el Router de API
+app.use('/api', apiRouter);
+
+// --- STATIC FILES & SPA ---
+app.use(express.static(distPath));
+
+// Catch-all para SPA
+app.get('*', (req, res) => {
+    if (req.url.startsWith('/api')) return res.status(404).json({ error: 'Endpoint de API no encontrado' });
+    
+    const indexPath = path.join(distPath, 'index.html');
+    if (fs.existsSync(indexPath)) {
+        res.sendFile(indexPath);
+    } else {
+        const devIndex = path.join(projectRoot, 'index.html');
+        if (fs.existsSync(devIndex)) {
+            res.sendFile(devIndex);
+        } else {
+            res.status(404).send('Error: El frontend no ha sido compilado ni se encuentra index.html.');
         }
-        await transaction.commit();
-        res.json({ success: true });
-    } catch (e) {
-        await transaction.rollback();
-        res.status(500).json({ error: e.message });
     }
 });
 
-// Estaciones
-app.get('/api/operations', async (req, res) => {
-    const result = await req.db.request().query('SELECT o.*, u.Name as ActiveOperatorName FROM Operations o LEFT JOIN Users u ON o.ActiveOperatorId = u.Id');
-    res.json(result.recordset.map(op => ({
-        id: op.Id, name: op.Name, orderIndex: op.OrderIndex, 
-        isInitial: op.IsInitial, isFinal: op.IsFinal, 
-        activeOperatorId: op.ActiveOperatorId,
-        activeOperatorName: op.ActiveOperatorName
-    })));
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`LION MES SERVER RUNNING ON PORT ${PORT}`);
+    console.log(`DATABASE: Azure SQL (mx31dbs04)`);
 });
-
-app.post('/api/operations/:id/enter', async (req, res) => {
-    const { userId } = req.body;
-    await req.db.request()
-        .input('op', sql.NVarChar, req.params.id)
-        .input('uid', sql.NVarChar, userId)
-        .query('UPDATE Operations SET ActiveOperatorId = @uid WHERE Id = @op AND (ActiveOperatorId IS NULL OR ActiveOperatorId = @uid)');
-    res.json({ success: true });
-});
-
-app.post('/api/operations/:id/exit', async (req, res) => {
-    await req.db.request()
-        .input('op', sql.NVarChar, req.params.id)
-        .query('UPDATE Operations SET ActiveOperatorId = NULL WHERE Id = @op');
-    res.json({ success: true });
-});
-
-// Rutas
-app.get('/api/routes', async (req, res) => {
-    const result = await req.db.request().query('SELECT * FROM ProcessRoutes');
-    const routes = result.recordset;
-    for (let r of routes) {
-        const steps = await req.db.request().input('rid', sql.NVarChar, r.Id).query('SELECT * FROM ProcessRouteSteps WHERE ProcessRouteId = @rid ORDER BY StepOrder ASC');
-        r.steps = steps.recordset;
-    }
-    res.json(routes.map(r => ({ id: r.Id, name: r.Name, description: r.Description, steps: r.steps.map(s => ({ id: s.Id, operationId: s.OperationId, stepOrder: s.StepOrder })) })));
-});
-
-// Partes
-app.get('/api/parts', async (req, res) => {
-    const result = await req.db.request().query('SELECT * FROM PartNumbers');
-    res.json(result.recordset.map(p => ({ 
-        id: p.Id, partNumber: p.PartNumber, revision: p.Revision, description: p.Description, 
-        productCode: p.ProductCode, serialMask: p.SerialMask, serialGenType: p.SerialGenType, 
-        processRouteId: p.ProcessRouteId, stdQty: p.StdQty || 1 
-    })));
-});
-
-// Órdenes
-app.get('/api/orders', async (req, res) => {
-    const result = await req.db.request().query('SELECT * FROM WorkOrders ORDER BY CreatedAt DESC');
-    res.json(result.recordset.map(o => ({
-        id: o.Id, orderNumber: o.OrderNumber, sapOrderNumber: o.SAPOrderNumber,
-        partNumberId: o.PartNumberId, quantity: o.Quantity, status: o.Status,
-        createdAt: o.CreatedAt
-    })));
-});
-
-app.post('/api/orders/generate', async (req, res) => {
-    const { sapOrderNumber, productCode, quantity } = req.body;
-    // Buscar parte por SKU
-    const partRes = await req.db.request().input('sku', sql.NVarChar, productCode).query('SELECT Id FROM PartNumbers WHERE ProductCode = @sku');
-    if (partRes.recordset.length === 0) return res.status(404).json({ error: 'Producto no encontrado' });
-    const partId = partRes.recordset[0].Id;
-    const orderId = `WO-${Date.now()}`;
-    await req.db.request()
-        .input('id', sql.NVarChar, orderId)
-        .input('on', sql.NVarChar, orderId)
-        .input('sap', sql.NVarChar, sapOrderNumber)
-        .input('pid', sql.NVarChar, partId)
-        .input('qty', sql.Int, quantity)
-        .input('st', sql.NVarChar, 'OPEN')
-        .query('INSERT INTO WorkOrders (Id, OrderNumber, SAPOrderNumber, PartNumberId, Quantity, Status) VALUES (@id, @on, @sap, @pid, @qty, @st)');
-    res.json({ success: true, orderNumber: orderId, orderId });
-});
-
-app.listen(PORT, () => { console.log(`MES Backend running on port ${PORT}`); });

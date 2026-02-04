@@ -1,13 +1,13 @@
 
 import React, { useState, useEffect } from 'react';
-import { HashRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { User, UserRole } from './types';
 import { db, dbSystem } from './services/storage';
 import { AuthContext } from './context/AuthContext';
 import { AlertProvider } from './context/AlertContext';
 
 // Icons
-import { Settings, LogOut, Scan, LayoutDashboard, XCircle, Loader2, BarChart3 } from 'lucide-react';
+import { Settings, LogOut, Scan, LayoutDashboard, XCircle, Loader2, BarChart3, Info, Globe, Database } from 'lucide-react';
 
 // Components
 import Login from './pages/Login';
@@ -95,6 +95,7 @@ function App() {
   const [dbStatus, setDbStatus] = useState<'connecting' | 'initializing' | 'ready' | 'error'>('connecting');
   const [dbLogs, setDbLogs] = useState<string[]>([]);
   const [errorMsg, setErrorMsg] = useState('');
+  const [showDiag, setShowDiag] = useState(false);
 
   // Startup Routine
   useEffect(() => {
@@ -109,10 +110,11 @@ function App() {
         setDbLogs(logs);
         
         // 3. Ready
-        setTimeout(() => setDbStatus('ready'), 1500); // Short delay to read logs
+        setTimeout(() => setDbStatus('ready'), 1000); 
       } catch (err: any) {
+        console.error("Critical Startup Error:", err);
         setDbStatus('error');
-        setErrorMsg(err.message || "Unknown Database Error");
+        setErrorMsg(err.message || "No se pudo establecer comunicación con el servidor central de AWS RDS.");
       }
     };
 
@@ -127,7 +129,7 @@ function App() {
         return true;
       }
       return false;
-    } catch (e) {
+    } catch (e: any) {
       console.error("Login error", e);
       return false;
     }
@@ -135,21 +137,20 @@ function App() {
 
   const logout = () => setUser(null);
 
-  // --- LOADING SCREEN (Initializing DB) ---
+  // --- LOADING SCREEN ---
   if (dbStatus === 'connecting' || dbStatus === 'initializing') {
     return (
       <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center text-white p-8">
         <Loader2 size={48} className="animate-spin text-red-600 mb-6" />
         <div className="flex items-center gap-3 mb-4">
             <div className="bg-red-600 text-white font-black text-2xl w-10 h-10 flex items-center justify-center rounded">H</div>
-            <h2 className="text-2xl font-bold">Li-Ion Manufacturing</h2>
+            <h2 className="text-2xl font-bold uppercase tracking-tighter">Li-Ion Manufacturing</h2>
         </div>
-        <p className="text-slate-400 mb-8">{dbStatus === 'connecting' ? 'Conectando a MS SQL Server...' : 'Verificando Estructura de Base de Datos...'}</p>
+        <p className="text-slate-400 mb-8">{dbStatus === 'connecting' ? 'Validando conexión con AWS RDS...' : 'Sincronizando esquemas de producción...'}</p>
         
-        <div className="w-full max-w-2xl bg-slate-950 rounded-lg p-4 font-mono text-xs h-64 overflow-y-auto border border-slate-800 shadow-inner">
-          <p className="text-green-500">$ system start --verbose</p>
-          <p className="text-blue-400">[INF] Attempting connection to SQL Instance...</p>
-          {dbStatus === 'initializing' && <p className="text-green-400">[OK] Connection Established.</p>}
+        <div className="w-full max-w-2xl bg-slate-950 rounded-2xl p-6 font-mono text-xs h-64 overflow-y-auto border border-slate-800 shadow-2xl">
+          <p className="text-green-500">$ boot --production --remote-db</p>
+          <p className="text-blue-400">[INF] API Endpoint: {dbSystem.getApiBaseUrl()}</p>
           {dbLogs.map((log, i) => (
             <p key={i} className="text-slate-300 ml-2">&gt; {log}</p>
           ))}
@@ -159,29 +160,45 @@ function App() {
     );
   }
 
-  // --- ERROR SCREEN (Connection Failed) ---
+  // --- ERROR SCREEN ---
   if (dbStatus === 'error') {
     return (
-      <div className="min-h-screen bg-red-950 flex items-center justify-center p-8">
-        <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full overflow-hidden">
-          <div className="bg-red-600 p-6 flex items-center">
-             <XCircle className="text-white mr-4" size={40} />
+      <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center p-8">
+        <div className="bg-white rounded-[2.5rem] shadow-2xl max-w-xl w-full overflow-hidden">
+          <div className="bg-red-600 p-8 flex items-center">
+             <XCircle className="text-white mr-6" size={48} />
              <div>
-                <h2 className="text-xl font-bold text-white">Error Crítico de Sistema</h2>
-                <p className="text-red-100 text-sm">Fallo en Conexión de Base de Datos</p>
+                <h2 className="text-2xl font-black text-white uppercase tracking-tight">Fallo Crítico de Sistema</h2>
+                <p className="text-red-100 text-xs font-bold uppercase tracking-widest opacity-80">Conectividad de Base de Datos Interrumpida</p>
              </div>
           </div>
-          <div className="p-8">
-            <div className="bg-red-50 p-4 rounded border border-red-100 mb-6">
-              <h3 className="font-bold text-red-800 mb-2 text-sm uppercase">Diagnóstico</h3>
-              <p className="text-red-700 font-mono text-sm break-words">{errorMsg}</p>
+          <div className="p-10">
+            <div className="bg-red-50 p-6 rounded-2xl border-2 border-red-100 mb-8">
+              <h3 className="font-black text-red-800 mb-1 text-[10px] uppercase tracking-widest">Servidor</h3>
+              <p className="text-red-700 font-mono text-xs break-all mb-4">{dbSystem.getApiBaseUrl()}</p>
+              <h3 className="font-black text-red-800 mb-1 text-[10px] uppercase tracking-widest">Mensaje Técnico</h3>
+              <p className="text-red-700 font-medium text-sm leading-relaxed">{errorMsg}</p>
             </div>
-            <p className="text-slate-600 text-sm mb-6">
-              La aplicación no puede iniciar porque no se detectó una instancia válida de MS SQL Server o la conexión fue rechazada.
-            </p>
-            <button onClick={() => window.location.reload()} className="w-full bg-slate-900 text-white py-3 rounded-lg font-medium hover:bg-slate-800 transition-colors">
-              Reintentar Conexión
-            </button>
+            
+            <div className="space-y-4">
+                <button onClick={() => window.location.reload()} className="w-full bg-slate-900 text-white py-4 rounded-2xl font-black hover:bg-slate-800 transition-all shadow-xl uppercase tracking-widest text-xs">
+                  Reintentar Conexión
+                </button>
+                <button onClick={() => setShowDiag(!showDiag)} className="w-full text-slate-400 py-2 font-bold uppercase tracking-widest text-[10px] hover:text-slate-600 transition-all">
+                  {showDiag ? 'Ocultar Información de Red' : 'Ver Detalles de Red'}
+                </button>
+            </div>
+
+            {showDiag && (
+                <div className="mt-8 pt-8 border-t border-slate-100 animate-in slide-in-from-top-4">
+                    <h4 className="font-black text-slate-800 text-xs uppercase tracking-widest mb-4">Diagnóstico de Producción</h4>
+                    <ul className="text-[10px] space-y-2 text-slate-500 font-medium">
+                        <li className="flex items-center gap-2"><Globe size={12}/> Red: Asegúrese de que el puerto 1433 esté abierto.</li>
+                        <li className="flex items-center gap-2"><Database size={12}/> AWS RDS: Verifique que la instancia 'liondb' esté activa en AWS Console.</li>
+                        <li className="flex items-center gap-2"><Info size={12}/> Firewall: Algunos entornos corporativos bloquean peticiones externas.</li>
+                    </ul>
+                </div>
+            )}
           </div>
         </div>
       </div>
@@ -191,7 +208,7 @@ function App() {
   return (
     <AlertProvider>
       <AuthContext.Provider value={{ user, login, logout }}>
-        <HashRouter>
+        <BrowserRouter>
           <Layout>
             <Routes>
               <Route path="/login" element={!user ? <Login /> : <Navigate to={user.role === 'OPERATOR' ? '/operator' : '/dashboard'} />} />
@@ -215,7 +232,7 @@ function App() {
               <Route path="*" element={<Navigate to="/login" />} />
             </Routes>
           </Layout>
-        </HashRouter>
+        </BrowserRouter>
       </AuthContext.Provider>
     </AlertProvider>
   );

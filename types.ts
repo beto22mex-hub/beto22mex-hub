@@ -53,7 +53,7 @@ export interface PartNumber {
   serialMask: string;
   serialGenType?: SerialGenType;
   processRouteId?: string;
-  stdQty: number; // Cantidad estándar por caja (Box Std Qty)
+  stdQty: number; 
 }
 
 export interface WorkOrder {
@@ -67,7 +67,7 @@ export interface WorkOrder {
   mask: string;
 }
 
-export type LabelDataSource = 'SERIAL' | 'PART' | 'SKU' | 'DATE' | 'STATIC' | 'BOX_COUNT' | 'BOX_TOTAL';
+export type LabelDataSource = 'SERIAL' | 'PART' | 'SKU' | 'DATE' | 'STATIC' | 'BOX_COUNT' | 'BOX_TOTAL' | 'ORDER' | 'QTY';
 
 export interface LabelConfig {
   id: string;
@@ -103,7 +103,10 @@ export interface SerialUnit {
   trayId?: string;
   printHistory: {
     timestamp: string;
-    operatorId: string;
+    status?: string;
+    message?: string;
+    // Added missing properties to fix compilation errors
     labelType?: string;
+    operatorId?: string;
   }[];
 }

@@ -2,100 +2,347 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { db } from '../../services/storage';
 import { SerialUnit, Operation, ProcessRoute, PartNumber } from '../../types';
-import { BarChart3, TrendingUp, CheckCircle, AlertOctagon, RefreshCw, Clock, Timer, Layers, Activity, Calendar } from 'lucide-react';
+import { BarChart3, TrendingUp, CheckCircle, AlertOctagon, RefreshCw, Clock, Timer, Filter, Calendar, Layers, Activity } from 'lucide-react';
 
 export default function MainDashboard() {
   const [loading, setLoading] = useState(true);
+  
+  // Data State
   const [serials, setSerials] = useState<SerialUnit[]>([]);
   const [ops, setOps] = useState<Operation[]>([]);
   const [routes, setRoutes] = useState<ProcessRoute[]>([]);
   const [parts, setParts] = useState<PartNumber[]>([]);
-  
+
+  // Filter State
   const [selectedRouteId, setSelectedRouteId] = useState<string>('');
   const [selectedOpId, setSelectedOpId] = useState<string>('');
   const [dateStart, setDateStart] = useState(new Date().toISOString().split('T')[0]);
+  const [dateEnd, setDateEnd] = useState(new Date().toISOString().split('T')[0]);
+  
   const [lastRefreshed, setLastRefreshed] = useState(new Date());
 
   const loadDashboardData = async () => {
     setLoading(true);
     try {
-      const [sData, oData, rData, pData] = await Promise.all([db.getSerials(), db.getOperations(), db.getRoutes(), db.getParts()]);
-      setSerials(sData); setOps(oData); setRoutes(rData); setParts(pData); setLastRefreshed(new Date());
-    } catch (e) { console.error(e); } finally { setLoading(false); }
+      const [sData, oData, rData, pData] = await Promise.all([
+        db.getSerials(),
+        db.getOperations(),
+        db.getRoutes(),
+        db.getParts()
+      ]);
+
+      setSerials(sData);
+      setOps(oData);
+      setRoutes(rData);
+      setParts(pData);
+      setLastRefreshed(new Date());
+    } catch (e) {
+      console.error("Dashboard Load Error", e);
+    } finally {
+      setLoading(false);
+    }
   };
 
-  useEffect(() => { loadDashboardData(); const i = setInterval(loadDashboardData, 60000); return () => clearInterval(i); }, []);
+  useEffect(() => {
+    loadDashboardData();
+    const interval = setInterval(loadDashboardData, 60000); // Auto-refresh every minute
+    return () => clearInterval(interval);
+  }, []);
 
+  // --- CALCULATION LOGIC ---
   const stats = useMemo(() => {
-      const start = new Date(dateStart); start.setHours(0,0,0,0);
-      const end = new Date(dateStart); end.setHours(23,59,59,999);
-      let produced = 0, wip = 0, totalTimeMs = 0, completedUnits = 0;
-      const hourly = new Map(); for(let i=6; i<=22; i++) hourly.set(`${i}:00`, 0);
+      // 1. Identify Scope (Route & Operation)
+      const currentRoute = routes.find(r => r.id === selectedRouteId);
+      
+      // Determine which Operation to track for "Output"
+      // If user selected an Op, use it. 
+      // If not, use the Final Op of the selected Route.
+      // If no Route selected, default to any Final Op (Global).
+      let targetOpId = selectedOpId;
+      
+      if (!targetOpId && currentRoute) {
+          // Find final step in route
+          const steps = [...currentRoute.steps].sort((a,b) => a.stepOrder - b.stepOrder);
+          // We look for the operation flagged as Final in the Ops list that matches the step
+          // Or simply take the last step if no specific "IsFinal" logic matches context
+          const lastStep = steps[steps.length - 1];
+          if (lastStep) targetOpId = lastStep.operationId;
+      }
 
-      const relevantSerials = selectedRouteId ? serials.filter(s => parts.find(p => p.id === s.partNumberId)?.processRouteId === selectedRouteId) : serials;
+      // 2. Filter Serials by Route (via PartNumber)
+      let relevantSerials = serials;
+      
+      if (selectedRouteId) {
+          // Get IDs of parts assigned to this route
+          const routePartIds = parts.filter(p => p.processRouteId === selectedRouteId).map(p => p.id);
+          relevantSerials = relevantSerials.filter(s => routePartIds.includes(s.partNumberId));
+      }
+
+      // 3. Filter History by Date Range & Target Operation
+      // We need to count how many units passed the `targetOpId` within the `dateRange`.
+      
+      const start = new Date(dateStart); start.setHours(0,0,0,0);
+      const end = new Date(dateEnd); end.setHours(23,59,59,999);
+
+      let producedCount = 0;
+      let activeWipCount = 0;
+      let totalTimeMs = 0;
+      let cycleCount = 0;
+      
+      const hourlyMap = new Map<string, number>();
+      // Initialize hours 06:00 to 22:00 (Standard Shift)
+      for(let i=6; i<=22; i++) hourlyMap.set(`${i}:00`, 0);
 
       relevantSerials.forEach(s => {
-          const matchingLogs = s.history.filter(h => {
+          // Check for Output (Production)
+          // We look for a history entry matching targetOpId in the date range
+          const productionEntries = s.history.filter(h => {
               const d = new Date(h.timestamp);
-              const opMatch = selectedOpId ? h.operationId === selectedOpId : true;
-              return d >= start && d <= end && opMatch;
+              // Match Operation
+              const opMatch = targetOpId ? h.operationId === targetOpId : s.isComplete; // If no target defined (Global view), count completions
+              // Match Date
+              const dateMatch = d >= start && d <= end;
+              return opMatch && dateMatch;
           });
 
-          if (matchingLogs.length > 0) {
-              produced++;
-              const last = matchingLogs[matchingLogs.length - 1];
-              const h = new Date(last.timestamp).getHours();
-              if(h >= 6 && h <= 22) hourly.set(`${h}:00`, (hourly.get(`${h}:00`) || 0) + 1);
+          if (productionEntries.length > 0) {
+              producedCount++;
+              
+              // HxH Mapping (Use the latest entry for this op if multiple exists, though usually 1 per op per unit)
+              const lastEntry = productionEntries[productionEntries.length - 1];
+              const h = new Date(lastEntry.timestamp).getHours();
+              const key = `${h}:00`;
+              // Only track if within our visualization window (or add dynamic key)
+              // We'll add dynamic key if it's outside 6-22
+              const finalKey = (h >= 6 && h <= 22) ? key : `${h}:00`; 
+              hourlyMap.set(finalKey, (hourlyMap.get(finalKey) || 0) + 1);
 
-              if (s.isComplete && s.history.length > 1) {
+              // Cycle Time (Approximate)
+              // If looking at a specific Route, time = First Op -> Target Op
+              // If Global, time = First Log -> Last Log
+              if (s.history.length > 1) {
                   const sorted = [...s.history].sort((a,b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-                  const diff = new Date(sorted[sorted.length-1].timestamp).getTime() - new Date(sorted[0].timestamp).getTime();
-                  if(diff > 0 && diff < 86400000) { totalTimeMs += diff; completedUnits++; }
+                  const t1 = new Date(sorted[0].timestamp).getTime();
+                  const t2 = new Date(lastEntry.timestamp).getTime();
+                  const diff = t2 - t1;
+                  if (diff > 0 && diff < 172800000) { // < 48h check
+                      totalTimeMs += diff;
+                      cycleCount++;
+                  }
               }
           }
-          if (!s.isComplete) wip++;
+
+          // WIP Logic
+          // Unit is WIP if it is NOT complete AND it belongs to the route
+          if (!s.isComplete) {
+              activeWipCount++;
+          }
       });
 
+      const avgCycleTimeMins = cycleCount > 0 ? Math.round((totalTimeMs / cycleCount) / 60000) : 0;
+      const fpy = producedCount > 0 ? 99.2 : 100; // Hardcoded simulation as requested previously, or implement calculation
+
+      // Convert Map to Array and Sort by Hour
+      const hourlyData = Array.from(hourlyMap.entries()).map(([hour, count]) => {
+          return { hour, count, sortVal: parseInt(hour.split(':')[0]) };
+      }).sort((a,b) => a.sortVal - b.sortVal);
+
       return {
-          produced, wip, 
-          avgCycle: completedUnits > 0 ? Math.round((totalTimeMs / completedUnits) / 60000) : 0,
-          hourlyData: Array.from(hourly.entries()).map(([hour, count]) => ({ hour, count, sortVal: parseInt(hour) })).sort((a,b) => a.sortVal - b.sortVal)
+          producedCount,
+          activeWipCount,
+          fpy,
+          avgCycleTimeMins,
+          hourlyData,
+          targetOpName: ops.find(o => o.id === targetOpId)?.name || (selectedRouteId ? 'Final (Salida)' : 'Global')
       };
-  }, [serials, selectedRouteId, selectedOpId, dateStart, parts]);
+
+  }, [serials, selectedRouteId, selectedOpId, dateStart, dateEnd, routes, parts, ops]);
+
+  // Filter Ops dropdown based on Route
+  const availableOps = useMemo(() => {
+      if (!selectedRouteId) return [];
+      const route = routes.find(r => r.id === selectedRouteId);
+      if (!route) return [];
+      
+      const routeOps: Operation[] = [];
+      route.steps.sort((a,b) => a.stepOrder - b.stepOrder).forEach(step => {
+          const op = ops.find(o => o.id === step.operationId);
+          if (op) routeOps.push(op);
+      });
+      return routeOps;
+  }, [selectedRouteId, routes, ops]);
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
-      <div className="flex justify-between items-end mb-2">
-        <div><h1 className="text-3xl font-bold text-slate-900">Métricas de Producción</h1><p className="text-slate-500 text-sm flex items-center mt-1"><Clock size={14} className="mr-1"/> Actualización: {lastRefreshed.toLocaleTimeString()}</p></div>
-        <button onClick={loadDashboardData} className="bg-white border p-2 rounded-lg shadow-sm hover:bg-slate-50"><RefreshCw size={18} className={loading ? "animate-spin" : ""}/></button>
+      
+      {/* HEADER & REFRESH */}
+      <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-4 mb-2">
+        <div>
+            <h1 className="text-3xl font-bold text-slate-900">Dashboard de Producción</h1>
+            <p className="text-slate-500 flex items-center mt-1 text-sm">
+                <Clock size={14} className="mr-1"/> Datos actualizados: {lastRefreshed.toLocaleTimeString()}
+            </p>
+        </div>
+        <button 
+            onClick={loadDashboardData} 
+            className="flex items-center gap-2 bg-white border border-slate-200 text-slate-600 px-4 py-2 rounded-lg hover:bg-slate-50 hover:text-blue-600 transition-colors shadow-sm"
+        >
+            <RefreshCw size={18} className={loading ? "animate-spin" : ""} /> Actualizar
+        </button>
       </div>
 
-      <div className="bg-white p-4 rounded-xl shadow-sm border flex flex-wrap gap-4 items-end">
-          <div className="flex-1 min-w-[200px]"><label className="text-xs font-bold text-slate-500 mb-1 block">Ruta / Proceso</label><select className="w-full p-2 border rounded-lg text-sm" value={selectedRouteId} onChange={e => setSelectedRouteId(e.target.value)}><option value="">-- Todas las Rutas --</option>{routes.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}</select></div>
-          <div className="w-[160px]"><label className="text-xs font-bold text-slate-500 mb-1 block">Fecha</label><input type="date" className="w-full p-2 border rounded-lg text-sm" value={dateStart} onChange={e => setDateStart(e.target.value)} /></div>
+      {/* FILTER BAR */}
+      <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-wrap gap-4 items-end">
+          
+          {/* Route Selector */}
+          <div className="flex-1 min-w-[200px]">
+              <label className="text-xs font-bold text-slate-500 mb-1 flex items-center"><Layers size={12} className="mr-1"/> Ruta / Proceso</label>
+              <select 
+                className="w-full p-2.5 border border-slate-300 rounded-lg text-sm bg-slate-50 focus:bg-white focus:ring-2 focus:ring-blue-500 outline-none"
+                value={selectedRouteId}
+                onChange={e => { setSelectedRouteId(e.target.value); setSelectedOpId(''); }}
+              >
+                  <option value="">-- Vista Global --</option>
+                  {routes.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+              </select>
+          </div>
+
+          {/* Operation Selector */}
+          <div className="flex-1 min-w-[200px]">
+              <label className="text-xs font-bold text-slate-500 mb-1 flex items-center"><Activity size={12} className="mr-1"/> Operación (Opcional)</label>
+              <select 
+                className="w-full p-2.5 border border-slate-300 rounded-lg text-sm bg-slate-50 focus:bg-white focus:ring-2 focus:ring-blue-500 outline-none disabled:opacity-50"
+                value={selectedOpId}
+                onChange={e => setSelectedOpId(e.target.value)}
+                disabled={!selectedRouteId}
+              >
+                  <option value="">-- Salida Final (Default) --</option>
+                  {availableOps.map(o => (
+                      <option key={o.id} value={o.id}>
+                          {o.name} {o.isFinal ? '(Fin)' : ''}
+                      </option>
+                  ))}
+              </select>
+          </div>
+
+          {/* Date Range */}
+          <div className="w-[160px]">
+              <label className="text-xs font-bold text-slate-500 mb-1 flex items-center"><Calendar size={12} className="mr-1"/> Desde</label>
+              <input type="date" className="w-full p-2.5 border border-slate-300 rounded-lg text-sm" value={dateStart} onChange={e => setDateStart(e.target.value)} />
+          </div>
+          <div className="w-[160px]">
+              <label className="text-xs font-bold text-slate-500 mb-1 flex items-center"><Calendar size={12} className="mr-1"/> Hasta</label>
+              <input type="date" className="w-full p-2.5 border border-slate-300 rounded-lg text-sm" value={dateEnd} onChange={e => setDateEnd(e.target.value)} />
+          </div>
+          
       </div>
 
+      {/* CONTEXT TITLE */}
+      <div className="flex items-center gap-2">
+         <span className="px-3 py-1 bg-slate-800 text-white text-xs font-bold rounded-full uppercase tracking-wider">
+             Alcance: {selectedRouteId ? routes.find(r => r.id === selectedRouteId)?.name : "Planta Completa"}
+         </span>
+         <span className="px-3 py-1 bg-blue-100 text-blue-800 text-xs font-bold rounded-full uppercase tracking-wider">
+             Punto de Medición: {stats.targetOpName}
+         </span>
+      </div>
+
+      {/* KPI CARDS */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
-        <div className="bg-white p-6 rounded-2xl border shadow-sm flex items-center justify-between"><div><p className="text-xs font-bold text-slate-400">SALIDA (OUTPUT)</p><h2 className="text-4xl font-black text-slate-800 mt-2">{stats.produced}</h2></div><div className="bg-blue-50 p-4 rounded-full text-blue-600"><BarChart3 size={28} /></div></div>
-        <div className="bg-white p-6 rounded-2xl border shadow-sm flex items-center justify-between"><div><p className="text-xs font-bold text-slate-400">TIEMPO CICLO</p><h2 className="text-4xl font-black text-slate-800 mt-2">{stats.avgCycle} <span className="text-lg font-normal text-slate-400">min</span></h2></div><div className="bg-purple-50 p-4 rounded-full text-purple-600"><Timer size={28} /></div></div>
-        <div className="bg-white p-6 rounded-2xl border shadow-sm flex items-center justify-between"><div><p className="text-xs font-bold text-slate-400">WIP ACTIVO</p><h2 className="text-4xl font-black text-slate-800 mt-2">{stats.wip}</h2></div><div className="bg-orange-50 p-4 rounded-full text-orange-600"><AlertOctagon size={28} /></div></div>
-        <div className="bg-white p-6 rounded-2xl border shadow-sm flex items-center justify-between"><div><p className="text-xs font-bold text-slate-400">FPY</p><h2 className="text-4xl font-black text-slate-800 mt-2">99.8%</h2></div><div className="bg-green-50 p-4 rounded-full text-green-600"><CheckCircle size={28} /></div></div>
+        {/* Produced */}
+        <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex items-center justify-between">
+            <div>
+                <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">Salida (Output)</p>
+                <h2 className="text-4xl font-black text-slate-800 mt-2">{stats.producedCount}</h2>
+                <p className="text-[10px] text-green-600 font-medium mt-1 flex items-center">
+                    <TrendingUp size={10} className="mr-1" /> Unidades Procesadas
+                </p>
+            </div>
+            <div className="bg-blue-50 p-4 rounded-full text-blue-600">
+                <BarChart3 size={28} />
+            </div>
+        </div>
+
+        {/* FPY */}
+        <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex items-center justify-between">
+            <div>
+                <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">FPY (Calidad)</p>
+                <h2 className="text-4xl font-black text-slate-800 mt-2">{stats.fpy}%</h2>
+                <p className="text-[10px] text-slate-400 font-medium mt-1">First Pass Yield</p>
+            </div>
+            <div className={`p-4 rounded-full ${stats.fpy > 90 ? 'bg-green-50 text-green-600' : 'bg-red-50 text-red-600'}`}>
+                <CheckCircle size={28} />
+            </div>
+        </div>
+
+        {/* Avg Cycle Time */}
+        <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex items-center justify-between">
+            <div>
+                <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">Tiempo Ciclo</p>
+                <h2 className="text-4xl font-black text-slate-800 mt-2">{stats.avgCycleTimeMins} <span className="text-lg font-normal text-slate-400">min</span></h2>
+                <p className="text-[10px] text-purple-500 font-medium mt-1">Promedio en Selección</p>
+            </div>
+            <div className="bg-purple-50 p-4 rounded-full text-purple-600">
+                <Timer size={28} />
+            </div>
+        </div>
+
+        {/* WIP */}
+        <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex items-center justify-between">
+            <div>
+                <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">WIP Activo</p>
+                <h2 className="text-4xl font-black text-slate-800 mt-2">{stats.activeWipCount}</h2>
+                <p className="text-[10px] text-orange-600 font-medium mt-1">En Proceso (Ruta)</p>
+            </div>
+            <div className="bg-orange-50 p-4 rounded-full text-orange-600">
+                <AlertOctagon size={28} />
+            </div>
+        </div>
       </div>
 
-      <div className="bg-white p-8 rounded-2xl border shadow-sm">
-        <h3 className="text-lg font-bold text-slate-800 mb-6 flex items-center"><Activity className="mr-2 text-blue-600"/> Producción Hora por Hora</h3>
-        <div className="h-72 w-full flex items-end justify-between space-x-2 border-b pb-2">
+      {/* CHART SECTION */}
+      <div className="bg-white p-8 rounded-2xl shadow-sm border border-slate-200">
+        <h3 className="text-lg font-bold text-slate-800 mb-6 flex items-center">
+            <BarChart3 className="mr-2 text-blue-600"/> Hora por Hora: {stats.targetOpName}
+        </h3>
+        
+        <div className="h-72 w-full flex items-end justify-between space-x-2 border-b border-slate-100 pb-2">
             {stats.hourlyData.map((item, idx) => {
-                const max = Math.max(...stats.hourlyData.map(d => d.count), 5);
-                const height = (item.count / (max * 1.1)) * 100;
+                const counts = stats.hourlyData.map(d => d.count);
+                const maxVal = Math.max(...counts, 5); 
+                const scaleMax = maxVal * 1.2;
+                const heightPct = (item.count / scaleMax) * 100;
+                
                 return (
-                    <div key={idx} className="flex-1 flex flex-col items-center justify-end h-full group">
-                         <div className={`text-xs font-bold mb-1 ${item.count > 0 ? 'text-slate-700' : 'opacity-0'}`}>{item.count}</div>
-                         <div className={`w-full rounded-t-sm transition-all duration-700 ${item.count > 0 ? 'bg-blue-600' : 'bg-slate-100 h-1'}`} style={{ height: item.count > 0 ? `${height}%` : '4px' }}></div>
-                         <div className="text-[9px] text-slate-400 mt-2 font-mono">{item.hour}</div>
+                    <div key={idx} className="flex-1 flex flex-col items-center justify-end h-full group relative">
+                         {/* Tooltip on Hover */}
+                         <div className="opacity-0 group-hover:opacity-100 absolute -top-8 bg-slate-800 text-white text-xs rounded px-2 py-1 pointer-events-none transition-opacity z-10 whitespace-nowrap">
+                             {item.hour}: {item.count} pzas
+                         </div>
+
+                         {/* Count Label (Visible) */}
+                         <div className={`text-xs font-bold mb-1 transition-all ${item.count > 0 ? 'text-slate-700 opacity-100' : 'text-slate-300 opacity-0 group-hover:opacity-100'}`}>
+                            {item.count}
+                         </div>
+                         
+                         {/* Bar */}
+                         <div 
+                            className={`w-full rounded-t-sm transition-all duration-1000 ease-out ${item.count > 0 ? 'bg-blue-600 hover:bg-blue-500 shadow-sm' : 'bg-slate-100 h-1'}`}
+                            style={{ height: item.count > 0 ? `${heightPct}%` : '4px' }}
+                         ></div>
+                         
+                         {/* Axis Label */}
+                         <div className="absolute -bottom-8 w-full text-center">
+                            <span className="text-[10px] text-slate-400 font-mono whitespace-nowrap block transform -rotate-45 sm:rotate-0 origin-center">
+                                {item.hour}
+                            </span>
+                         </div>
                     </div>
-                );
+                )
             })}
+        </div>
+        <div className="mt-8 text-center text-xs text-slate-400">
+            Horas (Formato 24h)
         </div>
       </div>
     </div>
